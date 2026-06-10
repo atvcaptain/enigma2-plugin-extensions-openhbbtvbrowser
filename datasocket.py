@@ -1,7 +1,11 @@
 # -*- coding: utf-8 -*-
+from __future__ import absolute_import
+
 from twisted.internet.protocol import ServerFactory, Protocol
 import os
 import struct
+
+SOCKET_PATH = "/tmp/openhbbtvbrowser.socket"
 
 browserclients = []
 onCommandReceived = []
@@ -10,68 +14,95 @@ onBrowserClosed = []
 
 class ClientConnection(Protocol):
     magic = 987654321
-    data = b''
-    headerformat = '!III'
+    headerformat = "!III"
     headersize = struct.calcsize(headerformat)
-    datasize = 0
-    cmd = 0
+
+    def __init__(self):
+        self.data = b""
+        self.datasize = None
+        self.cmd = 0
 
     def dataReceived(self, data):
         self.data += data
-        while len(self.data):
-            if self.datasize == 0:
-                if len(self.data) >= self.headersize:
-                    (magic, self.cmd, self.datasize) = struct.unpack(self.headerformat, self.data[:self.headersize])
-                    self.data = self.data[self.headersize:]
-                    if magic != self.magic:
-                        self.data = ''
-                        self.datasize = 0
-            if len(self.data) >= self.datasize:
-                global onCommandReceived
-                for x in onCommandReceived:
-                    x(self.cmd, self.data[:self.datasize])
-                    break
-                self.data = self.data[self.datasize:]
-                self.datasize = 0
-            else:
-                break
+        while True:
+            if self.datasize is None:
+                if len(self.data) < self.headersize:
+                    return
+                magic, self.cmd, self.datasize = struct.unpack(self.headerformat, self.data[:self.headersize])
+                self.data = self.data[self.headersize:]
+                if magic != self.magic or self.datasize > 1024 * 1024:
+                    self.data = b""
+                    self.datasize = None
+                    self.transport.loseConnection()
+                    return
+
+            if len(self.data) < self.datasize:
+                return
+
+            payload = self.data[:self.datasize]
+            self.data = self.data[self.datasize:]
+            cmd = self.cmd
+            self.cmd = 0
+            self.datasize = None
+
+            for callback in list(onCommandReceived):
+                callback(cmd, payload)
+
+            if not self.data:
+                return
 
     def connectionMade(self):
-        global browserclients
-        browserclients.append(self)
+        if self not in browserclients:
+            browserclients.append(self)
 
     def connectionLost(self, reason):
-        global browserclients
-        browserclients.remove(self)
-        if not len(browserclients):
-            global onBrowserClosed
-            for x in onBrowserClosed:
-                x()
+        if self in browserclients:
+            browserclients.remove(self)
+        if not browserclients:
+            for callback in list(onBrowserClosed):
+                callback()
 
 
 class CommandServer:
-    def __init__(self):
+    def __init__(self, socket_path=SOCKET_PATH):
         from twisted.internet import reactor
+        self.socket_path = socket_path
         self.factory = ServerFactory()
         self.factory.protocol = ClientConnection
         try:
-            os.remove('/tmp/openhbbtvbrowser.socket')
-        except:
+            os.remove(self.socket_path)
+        except OSError:
             pass
-        self.port = reactor.listenUNIX('/tmp/openhbbtvbrowser.socket', self.factory)
+        self.port = reactor.listenUNIX(self.socket_path, self.factory)
+
+    def close(self):
+        global browserclients
+        for client in list(browserclients):
+            client.transport.loseConnection()
+        browserclients = []
+        if self.port is not None:
+            try:
+                self.port.stopListening()
+            except Exception:
+                pass
+            self.port = None
+        try:
+            os.remove(self.socket_path)
+        except OSError:
+            pass
 
     def __del__(self):
-        global browserclients
-        for client in browserclients:
-            client.transport.loseConnection()
+        self.close()
 
-    def sendCommand(self, cmd, data=''):
-        global browserclients
-        for client in browserclients:
-            client.transport.write(struct.pack('!III', client.magic, cmd, len(data)))
-            if len(data):
+    def sendCommand(self, cmd, data=b""):
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        elif data is None:
+            data = b""
+        for client in list(browserclients):
+            client.transport.write(struct.pack("!III", client.magic, int(cmd), len(data)))
+            if data:
                 client.transport.write(data)
 
     def connectedClients(self):
-        global browserclients
         return len(browserclients)
