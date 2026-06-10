@@ -6,6 +6,7 @@ from enigma import eTimer, fbClass, eRCInput, eServiceReference
 import os
 from .browser import Browser
 from . import commands
+from .debuglog import log, log_exception
 
 try:
     from enigma import eHbbtv
@@ -24,6 +25,7 @@ class HbbTVWindow(Screen):
 
     def __init__(self, session, url=None, onid=0, tsid=0, sid=0):
         Screen.__init__(self, session)
+        log("[OpenHbbTV] HbbTVWindow init", url, onid, tsid, sid)
 
         global g_session
         g_session = session
@@ -52,12 +54,30 @@ class HbbTVWindow(Screen):
             browserinstance = Browser()
         browserinstance.start(self._url, self.onid, self.tsid, self.sid)
 
+    def open_hbbtv_url(self, url, onid=0, tsid=0, sid=0):
+        log("[OpenHbbTV] HbbTVWindow.open_hbbtv_url", url, onid, tsid, sid)
+        self._url = url
+        self.onid = int(onid)
+        self.tsid = int(tsid)
+        self.sid = int(sid)
+        global browserinstance
+        if not browserinstance:
+            browserinstance = Browser()
+        if browserinstance.connectedClients():
+            browserinstance.setCurrentChannel(self.onid, self.tsid, self.sid)
+            browserinstance.openUrl(self._url)
+        else:
+            browserinstance.start(self._url, self.onid, self.tsid, self.sid)
+            if not self.starttimer.isActive():
+                self.count = 0
+                self.starttimer.start(100)
+
     def _connect_signal(self, signal, callback):
         try:
             connection = signal.connect(callback)
             self._signal_connections.append(connection)
         except Exception as error:
-            print("[OpenHbbTV] Signal connect failed:", error)
+            log("[OpenHbbTV] Signal connect failed:", error)
 
     def _connect_hbbtv_signals(self):
         if not self.hbbtv:
@@ -82,12 +102,15 @@ class HbbTVWindow(Screen):
 
     def start_hbbtv_application(self):
         global browserinstance
+        log("[OpenHbbTV] start_hbbtv_application clients", browserinstance.connectedClients() if browserinstance else -1, "count", self.count)
         if browserinstance.connectedClients() == 0:
             self.count += 1
             if self.count > 50:
+                log("[OpenHbbTV] browser connect timeout, closing HbbTVWindow")
                 self.close()
             return
 
+        log("[OpenHbbTV] browser connected, lock fb/rc")
         self.starttimer.stop()
         fbClass.getInstance().lock()
         eRCInput.getInstance().lock()
@@ -110,7 +133,7 @@ class HbbTVWindow(Screen):
 
     def onBrowserCommand(self, cmd, data):
         payload = self._decode_payload(data)
-        print("[OpenHbbTV] Browser command", cmd, payload)
+        log("[OpenHbbTV] Browser command", cmd, payload)
 
         if cmd == commands.BROADCAST_PLAY:
             self._request_show()
@@ -140,13 +163,13 @@ class HbbTVWindow(Screen):
         elif cmd == commands.RESTORE_BROADCAST:
             self._restore_broadcast_service()
         elif cmd == commands.SET_CHANNEL:
-            print("[OpenHbbTV] SET_CHANNEL is not implemented yet:", payload)
+            log("[OpenHbbTV] SET_CHANNEL is not implemented yet:", payload)
         elif cmd == commands.PREV_CHANNEL:
-            print("[OpenHbbTV] PREV_CHANNEL is not implemented yet")
+            log("[OpenHbbTV] PREV_CHANNEL is not implemented yet")
         elif cmd == commands.NEXT_CHANNEL:
-            print("[OpenHbbTV] NEXT_CHANNEL is not implemented yet")
+            log("[OpenHbbTV] NEXT_CHANNEL is not implemented yet")
         elif cmd == commands.LOG:
-            print("[OpenHbbTV][Browser]", payload)
+            log("[OpenHbbTV][Browser]", payload)
 
     def _request_show(self):
         if self.hbbtv and hasattr(self.hbbtv, "debugEmitShow"):
@@ -185,7 +208,7 @@ class HbbTVWindow(Screen):
             position = int(payload)
         except Exception:
             position = 0
-        print("[OpenHbbTV] SEEK_STREAM requested:", position)
+        log("[OpenHbbTV] SEEK_STREAM requested:", position)
 
     def _request_create_application(self, uri):
         if not uri:
@@ -196,6 +219,7 @@ class HbbTVWindow(Screen):
             self._on_create_application_request(uri)
 
     def _page_load_finished(self):
+        log("[OpenHbbTV] page load finished")
         # A new page must not inherit a stale small broadcast window.
         # If the page needs a video/broadcast object, the browser will report it again.
         self._on_unset_video_window_request()
@@ -203,16 +227,17 @@ class HbbTVWindow(Screen):
             try:
                 self.hbbtv.pageLoadFinished()
             except Exception as error:
-                print("[OpenHbbTV] pageLoadFinished failed:", error)
+                log("[OpenHbbTV] pageLoadFinished failed:", error)
 
     def _handle_set_video_window_payload(self, payload):
+        log("[OpenHbbTV] handle SET_VIDEO_WINDOW payload", payload)
         try:
             values = [int(float(x.strip())) for x in payload.split(",")]
             x, y, w, h = values[:4]
             browser_w = values[4] if len(values) > 4 and values[4] > 0 else 1280
             browser_h = values[5] if len(values) > 5 and values[5] > 0 else 720
         except Exception as error:
-            print("[OpenHbbTV] Invalid SET_VIDEO_WINDOW payload:", payload, error)
+            log("[OpenHbbTV] Invalid SET_VIDEO_WINDOW payload:", payload, error)
             return
 
         global browserinstance
@@ -237,7 +262,7 @@ class HbbTVWindow(Screen):
             sref = sref.decode("utf-8", "replace")
         if not sref:
             return
-        print("[OpenHbbTV] playServiceRequest:", sref)
+        log("[OpenHbbTV] playServiceRequest:", sref)
         self.session.nav.playService(eServiceReference(str(sref)))
 
     def _on_play_stream_request(self, sref):
@@ -245,30 +270,30 @@ class HbbTVWindow(Screen):
             sref = sref.decode("utf-8", "replace")
         if not sref:
             return
-        print("[OpenHbbTV] playStreamRequest:", sref)
+        log("[OpenHbbTV] playStreamRequest:", sref)
         if self._stream_service is None:
             self._stream_service = self.session.nav.getCurrentlyPlayingServiceReference() or self.lastservice
         self.session.nav.playService(eServiceReference(str(sref)))
         self._set_stream_state(1, -1)
 
     def _on_pause_stream_request(self):
-        print("[OpenHbbTV] pauseStreamRequest")
+        log("[OpenHbbTV] pauseStreamRequest")
         try:
             service = self.session.nav.getCurrentService()
             pauseable = service and service.pause()
             if pauseable:
                 pauseable.pause()
         except Exception as error:
-            print("[OpenHbbTV] pause failed:", error)
+            log("[OpenHbbTV] pause failed:", error)
         self._set_stream_state(2, -1)
 
     def _on_stop_stream_request(self):
-        print("[OpenHbbTV] stopStreamRequest")
+        log("[OpenHbbTV] stopStreamRequest")
         self._restore_broadcast_service()
         self._set_stream_state(0, -1)
 
     def _on_set_video_window_request(self, x, y, w, h):
-        print("[OpenHbbTV] setVideoWindowRequest:", x, y, w, h)
+        log("[OpenHbbTV] setVideoWindowRequest:", x, y, w, h)
         if w <= 0 or h <= 0:
             self._on_unset_video_window_request()
             return
@@ -277,7 +302,7 @@ class HbbTVWindow(Screen):
         self._video_window_active = True
 
     def _on_unset_video_window_request(self):
-        print("[OpenHbbTV] unsetVideoWindowRequest")
+        log("[OpenHbbTV] unsetVideoWindowRequest")
         global browserinstance
         screen_w = browserinstance.screen_width if browserinstance else 1280
         screen_h = browserinstance.screen_height if browserinstance else 720
@@ -294,18 +319,18 @@ class HbbTVWindow(Screen):
                 if tmp:
                     resolved = tmp
             except Exception as error:
-                print("[OpenHbbTV] resolveApplicationLocator failed:", error)
-        print("[OpenHbbTV] createApplicationRequest:", uri, "->", resolved)
+                log("[OpenHbbTV] resolveApplicationLocator failed:", error)
+        log("[OpenHbbTV] createApplicationRequest:", uri, "->", resolved)
         self._on_unset_video_window_request()
         global browserinstance
         if resolved and browserinstance:
             browserinstance.openUrl(resolved)
 
     def _on_show_request(self):
-        print("[OpenHbbTV] show request")
+        log("[OpenHbbTV] show request")
 
     def _on_hide_request(self):
-        print("[OpenHbbTV] hide request")
+        log("[OpenHbbTV] hide request")
 
     def _restore_broadcast_service(self):
         ref = self._stream_service or self.lastservice
@@ -315,7 +340,7 @@ class HbbTVWindow(Screen):
                 if not current or current.toString() != ref.toString():
                     self.session.nav.playService(ref)
             except Exception as error:
-                print("[OpenHbbTV] restore broadcast failed:", error)
+                log("[OpenHbbTV] restore broadcast failed:", error)
         self._stream_service = None
 
     def _set_stream_state(self, state, error=-1):
@@ -343,7 +368,7 @@ class HbbTVWindow(Screen):
                 f.write(text)
             return True
         except OSError as error:
-            print("[OpenHbbTV] write failed %s=%s: %s" % (path, value, error))
+            log("[OpenHbbTV] write failed %s=%s: %s" % (path, value, error))
             return False
 
     def _save_video_window(self):
@@ -357,6 +382,7 @@ class HbbTVWindow(Screen):
         }
 
     def _write_video_window(self, x, y, w, h):
+        log("[OpenHbbTV] write video window", x, y, w, h)
         self._write_proc(self._vmpeg_path("dst_left"), x)
         self._write_proc(self._vmpeg_path("dst_top"), y)
         self._write_proc(self._vmpeg_path("dst_width"), w)
@@ -379,9 +405,16 @@ class HbbTVWindow(Screen):
         self._saved_video_window = None
 
     def onExit(self):
+        log("[OpenHbbTV] HbbTVWindow.onExit closing", self._closing)
         if self._closing:
             return
         self._closing = True
+        try:
+            from .plugin import HBBTVParser
+            if HBBTVParser.active_window is self:
+                HBBTVParser.active_window = None
+        except Exception:
+            pass
         global browserinstance
         if browserinstance:
             if self.onBrowserCommand in browserinstance.onCommand:
