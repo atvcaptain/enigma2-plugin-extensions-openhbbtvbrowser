@@ -220,9 +220,9 @@ class HbbTVWindow(Screen):
 
     def _page_load_finished(self):
         log("[OpenHbbTV] page load finished")
-        # A new page must not inherit a stale small broadcast window.
-        # If the page needs a video/broadcast object, the browser will report it again.
-        self._on_unset_video_window_request()
+        # Do not reset the video window here. Some HbbTV pages report
+        # video/broadcast during load and loadFinished arrives afterwards.
+        # Resetting here would immediately undo the reported window.
         if self.hbbtv and hasattr(self.hbbtv, "pageLoadFinished"):
             try:
                 self.hbbtv.pageLoadFinished()
@@ -353,6 +353,19 @@ class HbbTVWindow(Screen):
     def _vmpeg_path(self, name):
         return "/proc/stb/vmpeg/0/%s" % name
 
+    def _amlogic_axis_path(self):
+        return "/sys/class/video/axis"
+
+    def _video_window_backend(self):
+        # Dream One/Two and other Amlogic targets expose the video plane
+        # through sysfs, while older Broadcom-style targets use
+        # /proc/stb/vmpeg/0/dst_*. Detect this at runtime.
+        if os.path.exists(self._amlogic_axis_path()):
+            return "amlogic_axis"
+        if os.path.exists(self._vmpeg_path("dst_left")):
+            return "vmpeg_dst"
+        return "none"
+
     def _read_proc(self, path):
         try:
             with open(path, "r") as f:
@@ -360,48 +373,83 @@ class HbbTVWindow(Screen):
         except OSError:
             return ""
 
-    def _write_proc(self, path, value):
+    def _write_text(self, path, text):
         try:
-            current = self._read_proc(path)
-            text = "0x%x" % int(value) if current.lower().startswith("0x") else str(int(value))
             with open(path, "w") as f:
-                f.write(text)
+                f.write(str(text))
             return True
         except OSError as error:
-            log("[OpenHbbTV] write failed %s=%s: %s" % (path, value, error))
+            log("[OpenHbbTV] write failed %s=%s: %s" % (path, text, error))
             return False
+
+    def _write_proc(self, path, value):
+        current = self._read_proc(path)
+        text = "0x%x" % int(value) if current.lower().startswith("0x") else str(int(value))
+        return self._write_text(path, text)
 
     def _save_video_window(self):
         if self._saved_video_window is not None:
             return
-        self._saved_video_window = {
-            "dst_left": self._read_proc(self._vmpeg_path("dst_left")),
-            "dst_top": self._read_proc(self._vmpeg_path("dst_top")),
-            "dst_width": self._read_proc(self._vmpeg_path("dst_width")),
-            "dst_height": self._read_proc(self._vmpeg_path("dst_height")),
-        }
+        backend = self._video_window_backend()
+        if backend == "amlogic_axis":
+            self._saved_video_window = {
+                "backend": backend,
+                "axis": self._read_proc(self._amlogic_axis_path()),
+            }
+        elif backend == "vmpeg_dst":
+            self._saved_video_window = {
+                "backend": backend,
+                "dst_left": self._read_proc(self._vmpeg_path("dst_left")),
+                "dst_top": self._read_proc(self._vmpeg_path("dst_top")),
+                "dst_width": self._read_proc(self._vmpeg_path("dst_width")),
+                "dst_height": self._read_proc(self._vmpeg_path("dst_height")),
+            }
+        else:
+            self._saved_video_window = {"backend": "none"}
+        log("[OpenHbbTV] saved video window", self._saved_video_window)
+
+    def _write_amlogic_axis(self, x, y, w, h):
+        # Amlogic video axis uses absolute coordinates. Most kernels expect
+        # left top right bottom. Use inclusive right/bottom to avoid one-pixel
+        # overflow on drivers that validate against the screen size.
+        right = max(x, x + max(0, w) - 1)
+        bottom = max(y, y + max(0, h) - 1)
+        value = "%d %d %d %d" % (int(x), int(y), int(right), int(bottom))
+        log("[OpenHbbTV] write amlogic video axis", value)
+        return self._write_text(self._amlogic_axis_path(), value)
 
     def _write_video_window(self, x, y, w, h):
-        log("[OpenHbbTV] write video window", x, y, w, h)
-        self._write_proc(self._vmpeg_path("dst_left"), x)
-        self._write_proc(self._vmpeg_path("dst_top"), y)
-        self._write_proc(self._vmpeg_path("dst_width"), w)
-        self._write_proc(self._vmpeg_path("dst_height"), h)
-        self._write_proc(self._vmpeg_path("dst_apply"), 1)
+        backend = self._video_window_backend()
+        log("[OpenHbbTV] write video window", backend, x, y, w, h)
+        if backend == "amlogic_axis":
+            self._write_amlogic_axis(x, y, w, h)
+        elif backend == "vmpeg_dst":
+            self._write_proc(self._vmpeg_path("dst_left"), x)
+            self._write_proc(self._vmpeg_path("dst_top"), y)
+            self._write_proc(self._vmpeg_path("dst_width"), w)
+            self._write_proc(self._vmpeg_path("dst_height"), h)
+            self._write_proc(self._vmpeg_path("dst_apply"), 1)
+        else:
+            log("[OpenHbbTV] no supported video-window backend found")
 
     def _restore_video_window(self):
         if not self._saved_video_window:
             self._on_unset_video_window_request()
             return
-        for key in ("dst_left", "dst_top", "dst_width", "dst_height"):
-            value = self._saved_video_window.get(key)
-            if value:
-                try:
-                    with open(self._vmpeg_path(key), "w") as f:
-                        f.write(value)
-                except OSError:
-                    pass
-        self._write_proc(self._vmpeg_path("dst_apply"), 1)
+        backend = self._saved_video_window.get("backend")
+        log("[OpenHbbTV] restore video window", self._saved_video_window)
+        if backend == "amlogic_axis":
+            axis = self._saved_video_window.get("axis")
+            if axis:
+                self._write_text(self._amlogic_axis_path(), axis)
+        elif backend == "vmpeg_dst":
+            for key in ("dst_left", "dst_top", "dst_width", "dst_height"):
+                value = self._saved_video_window.get(key)
+                if value:
+                    self._write_text(self._vmpeg_path(key), value)
+            self._write_proc(self._vmpeg_path("dst_apply"), 1)
+        else:
+            self._on_unset_video_window_request()
         self._saved_video_window = None
 
     def onExit(self):
